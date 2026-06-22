@@ -159,13 +159,19 @@ static SecLabelItem *seclabels = NULL;
 static int	nseclabels = 0;
 
 /*
- * pg_dump_plus: auto-exclude isolated schemas whose name starts with this
- * prefix (default "__"), without building any dependency-graph metadata for
- * them.  Configurable via the PGDUMP_EXCLUDE_SCHEMA_PREFIX environment
- * variable; set it to an empty string to disable the behavior entirely.
+ * pg_dump_plus: aggressively exclude "isolated" schemas at the catalog-query
+ * level, so we never fetch metadata or build dependency-graph entries for
+ * them.  A schema is treated as isolated when its name starts with
+ * exclude_schema_prefix (default "__"; see PGDUMP_EXCLUDE_SCHEMA_PREFIX /
+ * --isolated-schema-prefix) OR when its exact name is listed via one or more
+ * --exclude-isolated-schema switches.  An empty prefix disables the prefix
+ * rule; an empty name list disables the by-name rule.
  */
 static const char *exclude_schema_prefix = NULL;
 static int	exclude_schema_prefix_len = 0;
+static SimpleStringList exclude_isolated_schema_names = {NULL, NULL};
+/* set by --isolated-schema-prefix; overrides the environment variable */
+static const char *exclude_schema_prefix_opt = NULL;
 
 /*
  * The default number of rows per INSERT when
@@ -212,6 +218,8 @@ static void prohibit_crossdb_refs(PGconn *conn, const char *dbname,
 								  const char *pattern);
 
 static NamespaceInfo *findNamespace(Oid nsoid);
+static bool schema_is_isolated(const char *nspname);
+static bool appendIsolatedSchemaOidSubquery(Archive *fout, PQExpBuffer buf);
 static void appendExcludedSchemaFilter(Archive *fout, PQExpBuffer query,
 									   const char *nspcol, bool isfirst);
 static void dumpTableData(Archive *fout, const TableDataInfo *tdinfo);
@@ -463,6 +471,10 @@ main(int argc, char **argv)
 		{"exclude-extension", required_argument, NULL, 17},
 		{"restrict-key", required_argument, NULL, 25},
 
+		/* pg_dump_plus extensions */
+		{"exclude-isolated-schema", required_argument, NULL, 30},
+		{"isolated-schema-prefix", required_argument, NULL, 31},
+
 		{NULL, 0, NULL, 0}
 	};
 
@@ -706,6 +718,15 @@ main(int argc, char **argv)
 				dopt.restrict_key = pg_strdup(optarg);
 				break;
 
+			case 30:			/* pg_dump_plus: exclude isolated schema by name */
+				simple_string_list_append(&exclude_isolated_schema_names,
+										  optarg);
+				break;
+
+			case 31:			/* pg_dump_plus: isolated-schema prefix */
+				exclude_schema_prefix_opt = pg_strdup(optarg);
+				break;
+
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -715,10 +736,15 @@ main(int argc, char **argv)
 
 	/*
 	 * pg_dump_plus: determine the schema-name prefix used to auto-exclude
-	 * isolated schemas.  Defaults to "__"; PGDUMP_EXCLUDE_SCHEMA_PREFIX
-	 * overrides it, and an empty value disables the feature.
+	 * isolated schemas.  Precedence: --isolated-schema-prefix, then the
+	 * PGDUMP_EXCLUDE_SCHEMA_PREFIX environment variable, then the "__"
+	 * default.  An empty value disables the prefix rule (named schemas given
+	 * via --exclude-isolated-schema are still excluded).
 	 */
-	exclude_schema_prefix = getenv("PGDUMP_EXCLUDE_SCHEMA_PREFIX");
+	if (exclude_schema_prefix_opt != NULL)
+		exclude_schema_prefix = exclude_schema_prefix_opt;
+	else
+		exclude_schema_prefix = getenv("PGDUMP_EXCLUDE_SCHEMA_PREFIX");
 	if (exclude_schema_prefix == NULL)
 		exclude_schema_prefix = "__";
 	exclude_schema_prefix_len = strlen(exclude_schema_prefix);
@@ -1175,6 +1201,13 @@ help(const char *progname)
 	printf(_("  --enable-row-security        enable row security (dump only content user has\n"
 			 "                               access to)\n"));
 	printf(_("  --exclude-extension=PATTERN  do NOT dump the specified extension(s)\n"));
+	printf(_("  --exclude-isolated-schema=NAME\n"
+			 "                               (pg_dump_plus) skip the named schema at the\n"
+			 "                               catalog level (no metadata/locks/deps fetched);\n"
+			 "                               repeatable\n"));
+	printf(_("  --isolated-schema-prefix=STR (pg_dump_plus) treat schemas whose name starts\n"
+			 "                               with STR as isolated and skip them (default \"__\";\n"
+			 "                               empty disables; also PGDUMP_EXCLUDE_SCHEMA_PREFIX)\n"));
 	printf(_("  --exclude-table-and-children=PATTERN\n"
 			 "                               do NOT dump the specified table(s), including\n"
 			 "                               child and partition tables\n"));
@@ -1874,16 +1907,14 @@ selectDumpableNamespace(NamespaceInfo *nsinfo, Archive *fout)
 		nsinfo->dobj.dump_contains = nsinfo->dobj.dump = DUMP_COMPONENT_NONE;
 
 	/*
-	 * pg_dump_plus: a schema whose name starts with the configured prefix
-	 * (default "__") is auto-excluded, just like an explicit -N switch.  This
-	 * guarantees a clean dump (no references into the schema, no CREATE SCHEMA)
-	 * regardless of which catalog queries we additionally short-circuit for
-	 * performance.
+	 * pg_dump_plus: an isolated schema (prefix match or named with
+	 * --exclude-isolated-schema) is auto-excluded, just like an explicit -N
+	 * switch.  This guarantees a clean dump (no references into the schema, no
+	 * CREATE SCHEMA) regardless of which catalog queries we additionally
+	 * short-circuit for performance.
 	 */
 	if (nsinfo->dobj.dump_contains &&
-		exclude_schema_prefix_len > 0 &&
-		strncmp(nsinfo->dobj.name, exclude_schema_prefix,
-				exclude_schema_prefix_len) == 0)
+		schema_is_isolated(nsinfo->dobj.name))
 		nsinfo->dobj.dump_contains = nsinfo->dobj.dump = DUMP_COMPONENT_NONE;
 
 	/*
@@ -5796,34 +5827,99 @@ findNamespace(Oid nsoid)
 }
 
 /*
+ * schema_is_isolated
+ *
+ * pg_dump_plus: return true if the named schema should be treated as an
+ * isolated schema and excluded from the dump -- either because its name
+ * starts with the configured prefix, or because it was named explicitly with
+ * --exclude-isolated-schema.
+ */
+static bool
+schema_is_isolated(const char *nspname)
+{
+	if (exclude_schema_prefix_len > 0 &&
+		strncmp(nspname, exclude_schema_prefix, exclude_schema_prefix_len) == 0)
+		return true;
+
+	if (exclude_isolated_schema_names.head != NULL &&
+		simple_string_list_member(&exclude_isolated_schema_names, nspname))
+		return true;
+
+	return false;
+}
+
+/*
+ * appendIsolatedSchemaOidSubquery
+ *
+ * pg_dump_plus: append a parenthesized scalar subquery yielding the OIDs of
+ * all isolated schemas (prefix match OR explicit name match).  Returns true
+ * if anything was appended (i.e. at least one isolation rule is active), false
+ * if the feature is entirely disabled, in which case nothing is appended.
+ */
+static bool
+appendIsolatedSchemaOidSubquery(Archive *fout, PQExpBuffer buf)
+{
+	bool		have_prefix = (exclude_schema_prefix_len > 0);
+	bool		have_names = (exclude_isolated_schema_names.head != NULL);
+	SimpleStringListCell *cell;
+
+	if (!have_prefix && !have_names)
+		return false;
+
+	appendPQExpBufferStr(buf,
+						 "(SELECT oid FROM pg_catalog.pg_namespace WHERE ");
+
+	if (have_prefix)
+	{
+		appendPQExpBuffer(buf, "left(nspname, %d) OPERATOR(pg_catalog.=) ",
+						  exclude_schema_prefix_len);
+		appendStringLiteralAH(buf, exclude_schema_prefix, fout);
+	}
+
+	if (have_names)
+	{
+		if (have_prefix)
+			appendPQExpBufferStr(buf, " OR ");
+		appendPQExpBufferStr(buf, "nspname OPERATOR(pg_catalog.=) ANY (ARRAY[");
+		for (cell = exclude_isolated_schema_names.head; cell; cell = cell->next)
+		{
+			if (cell != exclude_isolated_schema_names.head)
+				appendPQExpBufferChar(buf, ',');
+			appendStringLiteralAH(buf, cell->val, fout);
+		}
+		appendPQExpBufferStr(buf, "]::pg_catalog.name[])");
+	}
+
+	appendPQExpBufferChar(buf, ')');
+	return true;
+}
+
+/*
  * appendExcludedSchemaFilter
  *
  * pg_dump_plus: append a SQL predicate that drops, at the catalog-query level,
- * any object living in an auto-excluded ("__"-prefixed) schema, so that we
- * never fetch metadata or build dependency-graph entries for those isolated
- * schemas.  This is purely a performance optimization layered on top of the
- * authoritative exclusion in selectDumpableNamespace().
+ * any object living in an isolated schema, so that we never fetch metadata or
+ * build dependency-graph entries for those schemas.  This is purely a
+ * performance optimization layered on top of the authoritative exclusion in
+ * selectDumpableNamespace().
  *
  *	nspcol	 the namespace-OID column of the query (e.g. "c.relnamespace")
  *	isfirst	 true if the query has no WHERE clause yet (emit WHERE), false to
  *			 chain onto an existing one (emit AND)
  *
- * Does nothing when the feature is disabled (empty prefix).
+ * Does nothing when the feature is disabled.
  */
 static void
 appendExcludedSchemaFilter(Archive *fout, PQExpBuffer query,
 						   const char *nspcol, bool isfirst)
 {
-	if (exclude_schema_prefix_len == 0)
-		return;
+	PQExpBuffer sub = createPQExpBuffer();
 
-	appendPQExpBuffer(query,
-					  " %s %s NOT IN (SELECT oid FROM pg_catalog.pg_namespace "
-					  "WHERE left(nspname, %d) OPERATOR(pg_catalog.=) ",
-					  isfirst ? "WHERE" : "AND",
-					  nspcol, exclude_schema_prefix_len);
-	appendStringLiteralAH(query, exclude_schema_prefix, fout);
-	appendPQExpBufferStr(query, ")\n");
+	if (appendIsolatedSchemaOidSubquery(fout, sub))
+		appendPQExpBuffer(query, " %s %s NOT IN %s\n",
+						  isfirst ? "WHERE" : "AND", nspcol, sub->data);
+
+	destroyPQExpBuffer(sub);
 }
 
 /*
@@ -18658,34 +18754,26 @@ getDependencies(Archive *fout)
 
 	/*
 	 * pg_dump_plus: drop dependency rows that involve an object living in an
-	 * auto-excluded ("__"-prefixed) schema.  pg_depend holds an entry for
-	 * every rowtype/column/etc. of the (potentially millions of) relations in
-	 * such isolated schemas; fetching them all dominates runtime and memory
-	 * even though those objects are never dumped.  We only test the pg_class
-	 * and pg_type endpoints, which is where the bulk objects of such schemas
-	 * live.
+	 * isolated schema.  pg_depend holds an entry for every rowtype/column/etc.
+	 * of the (potentially millions of) relations in such schemas; fetching
+	 * them all dominates runtime and memory even though those objects are
+	 * never dumped.  We only test the pg_class and pg_type endpoints, which is
+	 * where the bulk objects of such schemas live.
 	 */
-	if (exclude_schema_prefix_len > 0)
 	{
 		PQExpBuffer exns = createPQExpBuffer();
 
-		appendPQExpBuffer(exns,
-						  "(SELECT oid FROM pg_catalog.pg_namespace "
-						  "WHERE left(nspname, %d) OPERATOR(pg_catalog.=) ",
-						  exclude_schema_prefix_len);
-		appendStringLiteralAH(exns, exclude_schema_prefix, fout);
-		appendPQExpBufferChar(exns, ')');
-
-		appendPQExpBuffer(query,
-						  "  AND NOT (classid = 'pg_class'::regclass AND objid IN "
-						  "(SELECT oid FROM pg_class WHERE relnamespace IN %s))\n"
-						  "  AND NOT (refclassid = 'pg_class'::regclass AND refobjid IN "
-						  "(SELECT oid FROM pg_class WHERE relnamespace IN %s))\n"
-						  "  AND NOT (classid = 'pg_type'::regclass AND objid IN "
-						  "(SELECT oid FROM pg_type WHERE typnamespace IN %s))\n"
-						  "  AND NOT (refclassid = 'pg_type'::regclass AND refobjid IN "
-						  "(SELECT oid FROM pg_type WHERE typnamespace IN %s))\n",
-						  exns->data, exns->data, exns->data, exns->data);
+		if (appendIsolatedSchemaOidSubquery(fout, exns))
+			appendPQExpBuffer(query,
+							  "  AND NOT (classid = 'pg_class'::regclass AND objid IN "
+							  "(SELECT oid FROM pg_class WHERE relnamespace IN %s))\n"
+							  "  AND NOT (refclassid = 'pg_class'::regclass AND refobjid IN "
+							  "(SELECT oid FROM pg_class WHERE relnamespace IN %s))\n"
+							  "  AND NOT (classid = 'pg_type'::regclass AND objid IN "
+							  "(SELECT oid FROM pg_type WHERE typnamespace IN %s))\n"
+							  "  AND NOT (refclassid = 'pg_type'::regclass AND refobjid IN "
+							  "(SELECT oid FROM pg_type WHERE typnamespace IN %s))\n",
+							  exns->data, exns->data, exns->data, exns->data);
 
 		destroyPQExpBuffer(exns);
 	}
