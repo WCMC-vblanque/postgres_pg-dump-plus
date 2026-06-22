@@ -18657,6 +18657,40 @@ getDependencies(Archive *fout)
 						 "WHERE deptype != 'p' AND deptype != 'e'\n");
 
 	/*
+	 * pg_dump_plus: drop dependency rows that involve an object living in an
+	 * auto-excluded ("__"-prefixed) schema.  pg_depend holds an entry for
+	 * every rowtype/column/etc. of the (potentially millions of) relations in
+	 * such isolated schemas; fetching them all dominates runtime and memory
+	 * even though those objects are never dumped.  We only test the pg_class
+	 * and pg_type endpoints, which is where the bulk objects of such schemas
+	 * live.
+	 */
+	if (exclude_schema_prefix_len > 0)
+	{
+		PQExpBuffer exns = createPQExpBuffer();
+
+		appendPQExpBuffer(exns,
+						  "(SELECT oid FROM pg_catalog.pg_namespace "
+						  "WHERE left(nspname, %d) OPERATOR(pg_catalog.=) ",
+						  exclude_schema_prefix_len);
+		appendStringLiteralAH(exns, exclude_schema_prefix, fout);
+		appendPQExpBufferChar(exns, ')');
+
+		appendPQExpBuffer(query,
+						  "  AND NOT (classid = 'pg_class'::regclass AND objid IN "
+						  "(SELECT oid FROM pg_class WHERE relnamespace IN %s))\n"
+						  "  AND NOT (refclassid = 'pg_class'::regclass AND refobjid IN "
+						  "(SELECT oid FROM pg_class WHERE relnamespace IN %s))\n"
+						  "  AND NOT (classid = 'pg_type'::regclass AND objid IN "
+						  "(SELECT oid FROM pg_type WHERE typnamespace IN %s))\n"
+						  "  AND NOT (refclassid = 'pg_type'::regclass AND refobjid IN "
+						  "(SELECT oid FROM pg_type WHERE typnamespace IN %s))\n",
+						  exns->data, exns->data, exns->data, exns->data);
+
+		destroyPQExpBuffer(exns);
+	}
+
+	/*
 	 * Since we don't treat pg_amop entries as separate DumpableObjects, we
 	 * have to translate their dependencies into dependencies of their parent
 	 * opfamily.  Ignore internal dependencies though, as those will point to
