@@ -70,6 +70,20 @@ pg_dump -d mydb -n 01_grid -n 04_stats -n 05_log -n 07_result -Fc -f out.dump
 
 Precedence for the prefix: `--isolated-schema-prefix` → `PGDUMP_EXCLUDE_SCHEMA_PREFIX` → `__`.
 
+### Startup notice
+
+Before reading any objects, pg_dump_plus prints to **stderr** (always, even
+without `--verbose`) the schemas it is ignoring, so you can confirm exactly
+what was left out:
+
+```
+pg_dump_plus: ignoring 12 isolated schema(s): big_schema_n2026…, big_schema_g2026…, …
+```
+
+If the feature is enabled but nothing matched, it prints
+`pg_dump_plus: no schemas matched the isolation rule(s)`. The message is on
+stderr, so it never contaminates a dump written to stdout.
+
 ## How it works (implementation)
 
 Two layers, kept deliberately separate:

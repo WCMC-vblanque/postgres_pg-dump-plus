@@ -5806,6 +5806,40 @@ getNamespaces(Archive *fout, int *numNamespaces)
 	PQclear(res);
 	destroyPQExpBuffer(query);
 
+	/*
+	 * pg_dump_plus: report up front which schemas are being ignored as
+	 * "isolated" (prefix match or --exclude-isolated-schema), so the operator
+	 * can confirm exactly what was left out of the dump.  Printed to stderr
+	 * regardless of --verbose.
+	 */
+	if (exclude_schema_prefix_len > 0 ||
+		exclude_isolated_schema_names.head != NULL)
+	{
+		PQExpBuffer ignored = createPQExpBuffer();
+		int			nignored = 0;
+
+		for (i = 0; i < ntups; i++)
+		{
+			if (schema_is_isolated(nsinfo[i].dobj.name))
+			{
+				if (nignored++ > 0)
+					appendPQExpBufferStr(ignored, ", ");
+				appendPQExpBufferStr(ignored, nsinfo[i].dobj.name);
+			}
+		}
+
+		if (nignored > 0)
+			fprintf(stderr,
+					"pg_dump_plus: ignoring %d isolated schema(s): %s\n",
+					nignored, ignored->data);
+		else
+			fprintf(stderr,
+					"pg_dump_plus: no schemas matched the isolation rule(s)\n");
+		fflush(stderr);
+
+		destroyPQExpBuffer(ignored);
+	}
+
 	*numNamespaces = ntups;
 
 	return nsinfo;
