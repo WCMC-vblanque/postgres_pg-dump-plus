@@ -159,6 +159,15 @@ static SecLabelItem *seclabels = NULL;
 static int	nseclabels = 0;
 
 /*
+ * pg_dump_plus: auto-exclude isolated schemas whose name starts with this
+ * prefix (default "__"), without building any dependency-graph metadata for
+ * them.  Configurable via the PGDUMP_EXCLUDE_SCHEMA_PREFIX environment
+ * variable; set it to an empty string to disable the behavior entirely.
+ */
+static const char *exclude_schema_prefix = NULL;
+static int	exclude_schema_prefix_len = 0;
+
+/*
  * The default number of rows per INSERT when
  * --inserts is specified without --rows-per-insert
  */
@@ -203,6 +212,8 @@ static void prohibit_crossdb_refs(PGconn *conn, const char *dbname,
 								  const char *pattern);
 
 static NamespaceInfo *findNamespace(Oid nsoid);
+static void appendExcludedSchemaFilter(Archive *fout, PQExpBuffer query,
+									   const char *nspcol, bool isfirst);
 static void dumpTableData(Archive *fout, const TableDataInfo *tdinfo);
 static void refreshMatViewData(Archive *fout, const TableDataInfo *tdinfo);
 static const char *getRoleName(const char *roleoid_str);
@@ -701,6 +712,16 @@ main(int argc, char **argv)
 				exit_nicely(1);
 		}
 	}
+
+	/*
+	 * pg_dump_plus: determine the schema-name prefix used to auto-exclude
+	 * isolated schemas.  Defaults to "__"; PGDUMP_EXCLUDE_SCHEMA_PREFIX
+	 * overrides it, and an empty value disables the feature.
+	 */
+	exclude_schema_prefix = getenv("PGDUMP_EXCLUDE_SCHEMA_PREFIX");
+	if (exclude_schema_prefix == NULL)
+		exclude_schema_prefix = "__";
+	exclude_schema_prefix_len = strlen(exclude_schema_prefix);
 
 	/*
 	 * Non-option argument specifies database name as long as it wasn't
@@ -1850,6 +1871,19 @@ selectDumpableNamespace(NamespaceInfo *nsinfo, Archive *fout)
 	if (nsinfo->dobj.dump_contains &&
 		simple_oid_list_member(&schema_exclude_oids,
 							   nsinfo->dobj.catId.oid))
+		nsinfo->dobj.dump_contains = nsinfo->dobj.dump = DUMP_COMPONENT_NONE;
+
+	/*
+	 * pg_dump_plus: a schema whose name starts with the configured prefix
+	 * (default "__") is auto-excluded, just like an explicit -N switch.  This
+	 * guarantees a clean dump (no references into the schema, no CREATE SCHEMA)
+	 * regardless of which catalog queries we additionally short-circuit for
+	 * performance.
+	 */
+	if (nsinfo->dobj.dump_contains &&
+		exclude_schema_prefix_len > 0 &&
+		strncmp(nsinfo->dobj.name, exclude_schema_prefix,
+				exclude_schema_prefix_len) == 0)
 		nsinfo->dobj.dump_contains = nsinfo->dobj.dump = DUMP_COMPONENT_NONE;
 
 	/*
@@ -5762,6 +5796,37 @@ findNamespace(Oid nsoid)
 }
 
 /*
+ * appendExcludedSchemaFilter
+ *
+ * pg_dump_plus: append a SQL predicate that drops, at the catalog-query level,
+ * any object living in an auto-excluded ("__"-prefixed) schema, so that we
+ * never fetch metadata or build dependency-graph entries for those isolated
+ * schemas.  This is purely a performance optimization layered on top of the
+ * authoritative exclusion in selectDumpableNamespace().
+ *
+ *	nspcol	 the namespace-OID column of the query (e.g. "c.relnamespace")
+ *	isfirst	 true if the query has no WHERE clause yet (emit WHERE), false to
+ *			 chain onto an existing one (emit AND)
+ *
+ * Does nothing when the feature is disabled (empty prefix).
+ */
+static void
+appendExcludedSchemaFilter(Archive *fout, PQExpBuffer query,
+						   const char *nspcol, bool isfirst)
+{
+	if (exclude_schema_prefix_len == 0)
+		return;
+
+	appendPQExpBuffer(query,
+					  " %s %s NOT IN (SELECT oid FROM pg_catalog.pg_namespace "
+					  "WHERE left(nspname, %d) OPERATOR(pg_catalog.=) ",
+					  isfirst ? "WHERE" : "AND",
+					  nspcol, exclude_schema_prefix_len);
+	appendStringLiteralAH(query, exclude_schema_prefix, fout);
+	appendPQExpBufferStr(query, ")\n");
+}
+
+/*
  * getExtensions:
  *	  read all extensions in the system catalogs and return them in the
  * ExtensionInfo* structure
@@ -5892,6 +5957,9 @@ getTypes(Archive *fout, int *numTypes)
 						 "typname[0] = '_' AND typelem != 0 AND "
 						 "(SELECT typarray FROM pg_type te WHERE oid = pg_type.typelem) = oid AS isarray "
 						 "FROM pg_type");
+
+	/* pg_dump_plus: skip types in auto-excluded schemas */
+	appendExcludedSchemaFilter(fout, query, "typnamespace", true);
 
 	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
 
@@ -6536,6 +6604,9 @@ getAggregates(Archive *fout, int *numAggs)
 		appendPQExpBufferChar(query, ')');
 	}
 
+	/* pg_dump_plus: skip aggregates in auto-excluded schemas */
+	appendExcludedSchemaFilter(fout, query, "p.pronamespace", false);
+
 	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
 
 	ntups = PQntuples(res);
@@ -6732,6 +6803,9 @@ getFuncs(Archive *fout, int *numFuncs)
 								 "deptype = 'e')");
 		appendPQExpBufferChar(query, ')');
 	}
+
+	/* pg_dump_plus: skip functions in auto-excluded schemas */
+	appendExcludedSchemaFilter(fout, query, "p.pronamespace", false);
 
 	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
 
@@ -7005,8 +7079,12 @@ getTables(Archive *fout, int *numTables)
 						 CppAsString2(RELKIND_COMPOSITE_TYPE) ", "
 						 CppAsString2(RELKIND_MATVIEW) ", "
 						 CppAsString2(RELKIND_FOREIGN_TABLE) ", "
-						 CppAsString2(RELKIND_PARTITIONED_TABLE) ")\n"
-						 "ORDER BY c.oid");
+						 CppAsString2(RELKIND_PARTITIONED_TABLE) ")\n");
+
+	/* pg_dump_plus: skip relations in auto-excluded schemas */
+	appendExcludedSchemaFilter(fout, query, "c.relnamespace", false);
+
+	appendPQExpBufferStr(query, "ORDER BY c.oid");
 
 	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
 
