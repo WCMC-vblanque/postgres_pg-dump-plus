@@ -998,12 +998,15 @@ main(int argc, char **argv)
 
 	/*
 	 * Now scan the database and create DumpableObject structs for all the
-	 * objects we intend to dump.
+	 * objects we intend to dump.  (pg_dump_plus: start the optional phase
+	 * timer here so it spans both getSchemaData and the dependency/ACL reads.)
 	 */
+	pgdp_timing_begin();
 	tblinfo = getSchemaData(fout, &numTables);
 
 	if (!dopt.schemaOnly)
 	{
+		pgdp_timing_mark("collecting table data references");
 		getTableData(&dopt, tblinfo, numTables, 0);
 		buildMatViewRefreshDependencies(fout);
 		if (dopt.dataOnly)
@@ -1027,11 +1030,13 @@ main(int argc, char **argv)
 	/*
 	 * Collect dependency data to assist in ordering the objects.
 	 */
+	pgdp_timing_mark("reading dependency data");
 	getDependencies(fout);
 
 	/*
 	 * Collect ACLs, comments, and security labels, if wanted.
 	 */
+	pgdp_timing_mark("collecting ACLs/comments/security labels");
 	if (!dopt.aclsSkip)
 		getAdditionalACLs(fout);
 	if (!dopt.no_comments)
@@ -1057,10 +1062,14 @@ main(int argc, char **argv)
 	 * the initial sort is mostly for cosmetic purposes: we sort by name to
 	 * ensure that logically identical schemas will dump identically.
 	 */
+	pgdp_timing_mark("sorting dumpable objects");
 	sortDumpableObjectsByTypeName(dobjs, numObjs);
 
 	sortDumpableObjects(dobjs, numObjs,
 						boundaryObjs[0].dumpId, boundaryObjs[1].dumpId);
+
+	/* pg_dump_plus: end of the metadata-collection timeline */
+	pgdp_timing_end();
 
 	/*
 	 * Create archive TOC entries for all the objects to be dumped, in a safe

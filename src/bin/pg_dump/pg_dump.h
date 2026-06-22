@@ -713,6 +713,11 @@ typedef struct _SubRelInfo
 
 extern TableInfo *getSchemaData(Archive *fout, int *numTablesPtr);
 
+/* pg_dump_plus: per-phase timing (PGDUMP_PLUS_TIMING), defined in common.c */
+extern void pgdp_timing_begin(void);
+extern void pgdp_timing_mark(const char *next_label);
+extern void pgdp_timing_end(void);
+
 extern void AssignDumpId(DumpableObject *dobj);
 extern void recordAdditionalCatalogID(CatalogId catId, DumpableObject *dobj);
 extern DumpId createDumpId(void);

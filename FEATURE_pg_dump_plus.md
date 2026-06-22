@@ -84,6 +84,25 @@ If the feature is enabled but nothing matched, it prints
 `pg_dump_plus: no schemas matched the isolation rule(s)`. The message is on
 stderr, so it never contaminates a dump written to stdout.
 
+## Phase timing (diagnostics)
+
+Set `PGDUMP_PLUS_TIMING=1` to print, to stderr, how long each metadata-read
+phase takes (the `getSchemaData` catalog reads plus `reading dependency data`,
+ACL/comment collection, and the object sort). Works regardless of `--verbose`
+and does not affect the dump.
+
+```
+PGDUMP_PLUS_TIMING=1 pg_dump -d mydb -n some_schema -s -f /dev/null
+...
+pg_dump_plus[timing] reading user-defined tables                  1.28s  (cum  1.38s)
+pg_dump_plus[timing] reading dependency data                     21.99s  (cum 24.84s)
+pg_dump_plus[timing] TOTAL catalog read                          26.00s
+```
+
+This makes it obvious where time goes. On a catalog bloated by millions of
+tables, `reading dependency data` (a full `pg_depend` scan) typically
+dominates the fixed per-dump cost, independent of how few objects you select.
+
 ## How it works (implementation)
 
 Two layers, kept deliberately separate:

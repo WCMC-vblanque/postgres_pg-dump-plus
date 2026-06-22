@@ -32,6 +32,86 @@
 #include "pg_backup_archiver.h"
 #include "pg_backup_utils.h"
 #include "pg_dump.h"
+#include "portability/instr_time.h"
+
+/*
+ * pg_dump_plus: optional per-phase timing of the catalog-read steps in
+ * getSchemaData().  Enabled by setting the PGDUMP_PLUS_TIMING environment
+ * variable to a non-empty value; output goes to stderr regardless of
+ * --verbose.  Pure measurement -- no effect on the dump itself.
+ */
+static bool pgdp_timing = false;
+static instr_time pgdp_total_start;
+static instr_time pgdp_phase_start;
+static const char *pgdp_phase_label = NULL;
+
+/*
+ * Close out the current phase (printing its duration) and arm the next one.
+ * Pass NULL to just flush the final phase.
+ */
+void
+pgdp_timing_mark(const char *next_label)
+{
+	instr_time	now;
+
+	if (!pgdp_timing)
+		return;
+
+	INSTR_TIME_SET_CURRENT(now);
+
+	if (pgdp_phase_label != NULL)
+	{
+		instr_time	dphase = now;
+		instr_time	dtotal = now;
+
+		INSTR_TIME_SUBTRACT(dphase, pgdp_phase_start);
+		INSTR_TIME_SUBTRACT(dtotal, pgdp_total_start);
+		fprintf(stderr, "pg_dump_plus[timing] %-44s %8.2fs  (cum %8.2fs)\n",
+				pgdp_phase_label,
+				INSTR_TIME_GET_DOUBLE(dphase),
+				INSTR_TIME_GET_DOUBLE(dtotal));
+		fflush(stderr);
+	}
+
+	pgdp_phase_label = next_label;
+	INSTR_TIME_SET_CURRENT(pgdp_phase_start);
+}
+
+/* Begin timing (called once before the catalog-read phases). */
+void
+pgdp_timing_begin(void)
+{
+	const char *env = getenv("PGDUMP_PLUS_TIMING");
+
+	pgdp_timing = (env != NULL && env[0] != '\0');
+	pgdp_phase_label = NULL;
+	INSTR_TIME_SET_CURRENT(pgdp_total_start);
+}
+
+/* Flush the last phase and print the grand total. */
+void
+pgdp_timing_end(void)
+{
+	instr_time	dtotal;
+
+	if (!pgdp_timing)
+		return;
+
+	pgdp_timing_mark(NULL);
+
+	INSTR_TIME_SET_CURRENT(dtotal);
+	INSTR_TIME_SUBTRACT(dtotal, pgdp_total_start);
+	fprintf(stderr, "pg_dump_plus[timing] %-44s %8.2fs\n",
+			"TOTAL catalog read", INSTR_TIME_GET_DOUBLE(dtotal));
+	fflush(stderr);
+}
+
+/*
+ * Mark a phase boundary and emit the normal --verbose progress message.
+ * Replaces bare pg_log_info() calls inside getSchemaData().
+ */
+#define PGDP_PHASE(label) \
+	do { pgdp_timing_mark(label); pg_log_info(label); } while (0)
 
 /*
  * Variables for mapping DumpId to DumpableObject
@@ -133,13 +213,13 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	 * extension membership needs to be consultable during decisions about
 	 * whether other objects are to be dumped.
 	 */
-	pg_log_info("reading extensions");
+	PGDP_PHASE("reading extensions");
 	extinfo = getExtensions(fout, &numExtensions);
 
-	pg_log_info("identifying extension members");
+	PGDP_PHASE("identifying extension members");
 	getExtensionMembership(fout, extinfo, numExtensions);
 
-	pg_log_info("reading schemas");
+	PGDP_PHASE("reading schemas");
 	(void) getNamespaces(fout, &numNamespaces);
 
 	/*
@@ -148,127 +228,127 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	 * However, we have to do getNamespaces first because the tables get
 	 * linked to their containing namespaces during getTables.
 	 */
-	pg_log_info("reading user-defined tables");
+	PGDP_PHASE("reading user-defined tables");
 	tblinfo = getTables(fout, &numTables);
 
 	getOwnedSeqs(fout, tblinfo, numTables);
 
-	pg_log_info("reading user-defined functions");
+	PGDP_PHASE("reading user-defined functions");
 	(void) getFuncs(fout, &numFuncs);
 
 	/* this must be after getTables and getFuncs */
-	pg_log_info("reading user-defined types");
+	PGDP_PHASE("reading user-defined types");
 	(void) getTypes(fout, &numTypes);
 
 	/* this must be after getFuncs, too */
-	pg_log_info("reading procedural languages");
+	PGDP_PHASE("reading procedural languages");
 	getProcLangs(fout, &numProcLangs);
 
-	pg_log_info("reading user-defined aggregate functions");
+	PGDP_PHASE("reading user-defined aggregate functions");
 	getAggregates(fout, &numAggregates);
 
-	pg_log_info("reading user-defined operators");
+	PGDP_PHASE("reading user-defined operators");
 	(void) getOperators(fout, &numOperators);
 
-	pg_log_info("reading user-defined access methods");
+	PGDP_PHASE("reading user-defined access methods");
 	getAccessMethods(fout, &numAccessMethods);
 
-	pg_log_info("reading user-defined operator classes");
+	PGDP_PHASE("reading user-defined operator classes");
 	getOpclasses(fout, &numOpclasses);
 
-	pg_log_info("reading user-defined operator families");
+	PGDP_PHASE("reading user-defined operator families");
 	getOpfamilies(fout, &numOpfamilies);
 
-	pg_log_info("reading user-defined text search parsers");
+	PGDP_PHASE("reading user-defined text search parsers");
 	getTSParsers(fout, &numTSParsers);
 
-	pg_log_info("reading user-defined text search templates");
+	PGDP_PHASE("reading user-defined text search templates");
 	getTSTemplates(fout, &numTSTemplates);
 
-	pg_log_info("reading user-defined text search dictionaries");
+	PGDP_PHASE("reading user-defined text search dictionaries");
 	getTSDictionaries(fout, &numTSDicts);
 
-	pg_log_info("reading user-defined text search configurations");
+	PGDP_PHASE("reading user-defined text search configurations");
 	getTSConfigurations(fout, &numTSConfigs);
 
-	pg_log_info("reading user-defined foreign-data wrappers");
+	PGDP_PHASE("reading user-defined foreign-data wrappers");
 	getForeignDataWrappers(fout, &numForeignDataWrappers);
 
-	pg_log_info("reading user-defined foreign servers");
+	PGDP_PHASE("reading user-defined foreign servers");
 	getForeignServers(fout, &numForeignServers);
 
-	pg_log_info("reading default privileges");
+	PGDP_PHASE("reading default privileges");
 	getDefaultACLs(fout, &numDefaultACLs);
 
-	pg_log_info("reading user-defined collations");
+	PGDP_PHASE("reading user-defined collations");
 	(void) getCollations(fout, &numCollations);
 
-	pg_log_info("reading user-defined conversions");
+	PGDP_PHASE("reading user-defined conversions");
 	getConversions(fout, &numConversions);
 
-	pg_log_info("reading type casts");
+	PGDP_PHASE("reading type casts");
 	getCasts(fout, &numCasts);
 
-	pg_log_info("reading transforms");
+	PGDP_PHASE("reading transforms");
 	getTransforms(fout, &numTransforms);
 
-	pg_log_info("reading table inheritance information");
+	PGDP_PHASE("reading table inheritance information");
 	inhinfo = getInherits(fout, &numInherits);
 
-	pg_log_info("reading event triggers");
+	PGDP_PHASE("reading event triggers");
 	getEventTriggers(fout, &numEventTriggers);
 
 	/* Identify extension configuration tables that should be dumped */
-	pg_log_info("finding extension tables");
+	PGDP_PHASE("finding extension tables");
 	processExtensionTables(fout, extinfo, numExtensions);
 
 	/* Link tables to parents, mark parents of target tables interesting */
-	pg_log_info("finding inheritance relationships");
+	PGDP_PHASE("finding inheritance relationships");
 	flagInhTables(fout, tblinfo, numTables, inhinfo, numInherits);
 
-	pg_log_info("reading column info for interesting tables");
+	PGDP_PHASE("reading column info for interesting tables");
 	getTableAttrs(fout, tblinfo, numTables);
 
-	pg_log_info("flagging inherited columns in subtables");
+	PGDP_PHASE("flagging inherited columns in subtables");
 	flagInhAttrs(fout, tblinfo, numTables);
 
-	pg_log_info("reading partitioning data");
+	PGDP_PHASE("reading partitioning data");
 	getPartitioningInfo(fout);
 
-	pg_log_info("reading indexes");
+	PGDP_PHASE("reading indexes");
 	getIndexes(fout, tblinfo, numTables);
 
-	pg_log_info("flagging indexes in partitioned tables");
+	PGDP_PHASE("flagging indexes in partitioned tables");
 	flagInhIndexes(fout, tblinfo, numTables);
 
-	pg_log_info("reading extended statistics");
+	PGDP_PHASE("reading extended statistics");
 	getExtendedStatistics(fout);
 
-	pg_log_info("reading constraints");
+	PGDP_PHASE("reading constraints");
 	getConstraints(fout, tblinfo, numTables);
 
-	pg_log_info("reading triggers");
+	PGDP_PHASE("reading triggers");
 	getTriggers(fout, tblinfo, numTables);
 
-	pg_log_info("reading rewrite rules");
+	PGDP_PHASE("reading rewrite rules");
 	getRules(fout, &numRules);
 
-	pg_log_info("reading policies");
+	PGDP_PHASE("reading policies");
 	getPolicies(fout, tblinfo, numTables);
 
-	pg_log_info("reading publications");
+	PGDP_PHASE("reading publications");
 	(void) getPublications(fout, &numPublications);
 
-	pg_log_info("reading publication membership of tables");
+	PGDP_PHASE("reading publication membership of tables");
 	getPublicationTables(fout, tblinfo, numTables);
 
-	pg_log_info("reading publication membership of schemas");
+	PGDP_PHASE("reading publication membership of schemas");
 	getPublicationNamespaces(fout);
 
-	pg_log_info("reading subscriptions");
+	PGDP_PHASE("reading subscriptions");
 	getSubscriptions(fout);
 
-	pg_log_info("reading subscription membership of tables");
+	PGDP_PHASE("reading subscription membership of tables");
 	getSubscriptionTables(fout);
 
 	free(inhinfo);				/* not needed any longer */
