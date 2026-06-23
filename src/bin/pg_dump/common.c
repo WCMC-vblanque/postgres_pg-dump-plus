@@ -858,6 +858,42 @@ findObjectByCatalogId(CatalogId catalogId)
 }
 
 /*
+ * pg_dump_plus: collect the CatalogIds of every registered DumpableObject.
+ *
+ * Returns a palloc'd array (caller frees) and sets *numCatalogIds.  Used by the
+ * fast getDependencies() path to fetch only the dependencies of objects we
+ * actually loaded -- via an indexed join against a temp table -- instead of
+ * scanning all of pg_depend.  This is exactly equivalent to the normal path,
+ * because getDependencies() ignores any dependency whose depender is not a
+ * known object anyway.
+ */
+CatalogId *
+getRegisteredCatalogIds(int *numCatalogIds)
+{
+	CatalogId  *ids;
+	int			n = 0;
+	catalogid_iterator iter;
+	CatalogIdMapEntry *entry;
+
+	if (catalogIdHash == NULL)
+	{
+		*numCatalogIds = 0;
+		return NULL;
+	}
+
+	ids = (CatalogId *) pg_malloc(catalogIdHash->members * sizeof(CatalogId));
+	catalogid_start_iterate(catalogIdHash, &iter);
+	while ((entry = catalogid_iterate(catalogIdHash, &iter)) != NULL)
+	{
+		if (entry->dobj != NULL)
+			ids[n++] = entry->catId;
+	}
+
+	*numCatalogIds = n;
+	return ids;
+}
+
+/*
  * Build an array of pointers to all known dumpable objects
  *
  * This simply creates a modifiable copy of the internal map.

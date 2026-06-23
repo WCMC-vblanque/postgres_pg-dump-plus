@@ -84,6 +84,29 @@ If the feature is enabled but nothing matched, it prints
 `pg_dump_plus: no schemas matched the isolation rule(s)`. The message is on
 stderr, so it never contaminates a dump written to stdout.
 
+## Fast dependency collection (`PGDUMP_PLUS_FAST_DEPS`)
+
+Stock `pg_dump` reads dependency data with a single full scan of `pg_depend`.
+On a catalog bloated by millions of isolated-schema objects, that scan alone
+costs ~20-25s on every dump, no matter how few objects you select.
+
+pg_dump_plus replaces it (enabled by default) with a query that fetches
+dependencies **only for the objects actually loaded**: it snapshots their
+CatalogIds and emits them grouped per catalog as
+`classid = K AND objid = ANY(ARRAY[...])` clauses, which the planner satisfies
+with index/bitmap scans on `pg_depend(classid, objid)` — never scanning the
+whole catalog. No temp table is used (pg_dump runs read-only).
+
+This is provably equivalent to the original query: `getDependencies()` already
+discards any dependency whose depender is not a loaded object.
+
+- Default: **on**. Disable with `PGDUMP_PLUS_FAST_DEPS=0` to fall back to the
+  safe full-scan path (still with isolated-schema filtering).
+- Measured (4 schemas, schema-only, ~1.5M `__` tables): `reading dependency
+  data` dropped from **~23s to ~0.09s**; total catalog read from **~27s to
+  ~4s**. Output is byte-identical to the safe path (verified with `diff`,
+  ignoring the random per-run `\restrict` token).
+
 ## Phase timing (diagnostics)
 
 Set `PGDUMP_PLUS_TIMING=1` to print, to stderr, how long each metadata-read

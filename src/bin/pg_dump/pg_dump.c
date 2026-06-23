@@ -49,6 +49,7 @@
 #include "catalog/pg_class_d.h"
 #include "catalog/pg_constraint_d.h"
 #include "catalog/pg_default_acl_d.h"
+#include "portability/instr_time.h"
 #include "catalog/pg_largeobject_d.h"
 #include "catalog/pg_largeobject_metadata_d.h"
 #include "catalog/pg_proc_d.h"
@@ -18761,6 +18762,24 @@ processExtensionTables(Archive *fout, ExtensionInfo extinfo[],
 }
 
 /*
+ * pg_dump_plus: qsort comparator to group CatalogIds by classid (tableoid),
+ * then oid, so the fast getDependencies() path can emit one IN-array per
+ * catalog.
+ */
+static int
+catalogIdClassCmp(const void *a, const void *b)
+{
+	const CatalogId *ca = (const CatalogId *) a;
+	const CatalogId *cb = (const CatalogId *) b;
+
+	if (ca->tableoid != cb->tableoid)
+		return (ca->tableoid < cb->tableoid) ? -1 : 1;
+	if (ca->oid != cb->oid)
+		return (ca->oid < cb->oid) ? -1 : 1;
+	return 0;
+}
+
+/*
  * getDependencies --- obtain available dependency data
  */
 static void
@@ -18783,42 +18802,113 @@ getDependencies(Archive *fout)
 	query = createPQExpBuffer();
 
 	/*
-	 * Messy query to collect the dependency data we need.  Note that we
-	 * ignore the sub-object column, so that dependencies of or on a column
-	 * look the same as dependencies of or on a whole table.
-	 *
-	 * PIN dependencies aren't interesting, and EXTENSION dependencies were
-	 * already processed by getExtensionMembership.
-	 */
-	appendPQExpBufferStr(query, "SELECT "
-						 "classid, objid, refclassid, refobjid, deptype "
-						 "FROM pg_depend "
-						 "WHERE deptype != 'p' AND deptype != 'e'\n");
-
-	/*
-	 * pg_dump_plus: drop dependency rows that involve an object living in an
-	 * isolated schema.  pg_depend holds an entry for every rowtype/column/etc.
-	 * of the (potentially millions of) relations in such schemas; fetching
-	 * them all dominates runtime and memory even though those objects are
-	 * never dumped.  We only test the pg_class and pg_type endpoints, which is
-	 * where the bulk objects of such schemas live.
+	 * pg_dump_plus: by default ("radical" fast path; disable with
+	 * PGDUMP_PLUS_FAST_DEPS=0) fetch dependencies ONLY for the objects we
+	 * actually loaded, via an indexed join against a temp table of their
+	 * CatalogIds.  On a database whose pg_depend is bloated by millions of
+	 * rows from isolated schemas, this avoids the multi-second full scan of
+	 * pg_depend.  It is equivalent to the normal query because the loop below
+	 * ignores any dependency whose depender is not a known object anyway.
 	 */
 	{
-		PQExpBuffer exns = createPQExpBuffer();
+		const char *fastenv = getenv("PGDUMP_PLUS_FAST_DEPS");
+		bool		fast_deps = (fastenv == NULL || fastenv[0] != '0');
+		const char *timeenv = getenv("PGDUMP_PLUS_TIMING");
+		bool		timing = (timeenv != NULL && timeenv[0] != '\0');
 
-		if (appendIsolatedSchemaOidSubquery(fout, exns))
-			appendPQExpBuffer(query,
-							  "  AND NOT (classid = 'pg_class'::regclass AND objid IN "
-							  "(SELECT oid FROM pg_class WHERE relnamespace IN %s))\n"
-							  "  AND NOT (refclassid = 'pg_class'::regclass AND refobjid IN "
-							  "(SELECT oid FROM pg_class WHERE relnamespace IN %s))\n"
-							  "  AND NOT (classid = 'pg_type'::regclass AND objid IN "
-							  "(SELECT oid FROM pg_type WHERE typnamespace IN %s))\n"
-							  "  AND NOT (refclassid = 'pg_type'::regclass AND refobjid IN "
-							  "(SELECT oid FROM pg_type WHERE typnamespace IN %s))\n",
-							  exns->data, exns->data, exns->data, exns->data);
+		if (fast_deps)
+		{
+			CatalogId  *ids;
+			int			nids;
+			int			k;
+			instr_time	t0;
 
-		destroyPQExpBuffer(exns);
+			INSTR_TIME_SET_CURRENT(t0);
+
+			/*
+			 * Snapshot the CatalogIds of every loaded DumpableObject and emit
+			 * them grouped by catalog as "classid = K AND objid = ANY(ARRAY..)"
+			 * clauses.  The planner satisfies each group with an index/bitmap
+			 * scan on pg_depend(classid, objid), so we never scan the whole
+			 * (isolated-schema-bloated) catalog.  Works in pg_dump's read-only
+			 * transaction (no temp table required).
+			 */
+			ids = getRegisteredCatalogIds(&nids);
+			qsort(ids, nids, sizeof(CatalogId), catalogIdClassCmp);
+
+			appendPQExpBufferStr(query,
+								 "SELECT d.classid, d.objid, d.refclassid, "
+								 "d.refobjid, d.deptype "
+								 "FROM pg_depend d "
+								 "WHERE d.deptype != 'p' AND d.deptype != 'e' AND (");
+
+			if (nids == 0)
+				appendPQExpBufferStr(query, "false");
+
+			k = 0;
+			while (k < nids)
+			{
+				Oid			cls = ids[k].tableoid;
+				bool		firstoid = true;
+
+				if (k > 0)
+					appendPQExpBufferStr(query, " OR ");
+				appendPQExpBuffer(query,
+								  "(d.classid = '%u'::pg_catalog.oid AND "
+								  "d.objid = ANY('{", cls);
+				while (k < nids && ids[k].tableoid == cls)
+				{
+					if (!firstoid)
+						appendPQExpBufferChar(query, ',');
+					appendPQExpBuffer(query, "%u", ids[k].oid);
+					firstoid = false;
+					k++;
+				}
+				appendPQExpBufferStr(query, "}'::pg_catalog.oid[]))");
+			}
+			appendPQExpBufferStr(query, ")\n");
+
+			if (timing)
+			{
+				instr_time	d;
+
+				INSTR_TIME_SET_CURRENT(d);
+				INSTR_TIME_SUBTRACT(d, t0);
+				fprintf(stderr,
+						"pg_dump_plus[timing]   fast-deps: built filter for %d loaded object ids in %.2fs\n",
+						nids, INSTR_TIME_GET_DOUBLE(d));
+				fflush(stderr);
+			}
+
+			free(ids);
+		}
+		else
+		{
+			PQExpBuffer exns = createPQExpBuffer();
+
+			/*
+			 * Safe path: original full scan of pg_depend, with isolated-schema
+			 * objects filtered out (correct, but must scan the whole catalog).
+			 */
+			appendPQExpBufferStr(query, "SELECT "
+								 "classid, objid, refclassid, refobjid, deptype "
+								 "FROM pg_depend "
+								 "WHERE deptype != 'p' AND deptype != 'e'\n");
+
+			if (appendIsolatedSchemaOidSubquery(fout, exns))
+				appendPQExpBuffer(query,
+								  "  AND NOT (classid = 'pg_class'::regclass AND objid IN "
+								  "(SELECT oid FROM pg_class WHERE relnamespace IN %s))\n"
+								  "  AND NOT (refclassid = 'pg_class'::regclass AND refobjid IN "
+								  "(SELECT oid FROM pg_class WHERE relnamespace IN %s))\n"
+								  "  AND NOT (classid = 'pg_type'::regclass AND objid IN "
+								  "(SELECT oid FROM pg_type WHERE typnamespace IN %s))\n"
+								  "  AND NOT (refclassid = 'pg_type'::regclass AND refobjid IN "
+								  "(SELECT oid FROM pg_type WHERE typnamespace IN %s))\n",
+								  exns->data, exns->data, exns->data, exns->data);
+
+			destroyPQExpBuffer(exns);
+		}
 	}
 
 	/*

@@ -718,6 +718,9 @@ extern void pgdp_timing_begin(void);
 extern void pgdp_timing_mark(const char *next_label);
 extern void pgdp_timing_end(void);
 
+/* pg_dump_plus: fast-dependency helper (PGDUMP_PLUS_FAST_DEPS), in common.c */
+extern CatalogId *getRegisteredCatalogIds(int *numCatalogIds);
+
 extern void AssignDumpId(DumpableObject *dobj);
 extern void recordAdditionalCatalogID(CatalogId catId, DumpableObject *dobj);
 extern DumpId createDumpId(void);
