@@ -198,3 +198,73 @@ those compression methods.
 - The patch is additive and gated: with no prefix and no
   `--exclude-isolated-schema`, behavior is identical to stock `pg_dump`.
 - Custom `pg_dump` must be **≥** the server version, as always.
+
+---
+
+## Upstream / generality assessment (TODO: work on this later)
+
+Root problem this addresses: **`pg_dump` degrades badly on databases with a very
+large number of relations** (here ~1.5M tables across isolated schemas). This is
+a recognized, recurring topic on `pgsql-hackers`; incremental fixes have landed
+over recent versions. Our case is an extreme but legitimate instance.
+
+### Summary of changes and measured impact
+
+| # | Change | Problem | Impact |
+|---|---|---|---|
+| 1 | Catalog-level schema exclusion pushed into `getTables/getTypes/getFuncs/getAggregates` | stock reads metadata + `LOCK TABLE`s excluded schemas → OOM crash | stock **crashes** → completes |
+| 2 | Fast `getDependencies` (`PGDUMP_PLUS_FAST_DEPS`): fetch deps only for loaded objects via indexed `classid/objid` lookups | full `pg_depend` scan is O(whole catalog), not O(what you dump) | **23 s → 0.09 s** |
+| 3 | Skip `buildMatViewRefreshDependencies` when no matview is dumped | recursive `pg_depend` walk for matviews that may not exist | **8+ min hang → 0 s** |
+| 4 | `--exclude-isolated-schema`, `--isolated-schema-prefix`, env vars | configurable exclusion | usability |
+| 5 | Startup notice of ignored schemas | transparency | — |
+| 6 | `PGDUMP_PLUS_TIMING` per-phase chronometer | diagnose bottlenecks | — |
+
+Net: fixed per-dump overhead **~26 s → ~2–4 s**; crash → working dump.
+
+### Generality tiers
+
+**🟢 Genuinely general (upstreamable):**
+- **#3 — matview guard.** Any DB with a large `pg_depend` and few/no matviews
+  pays for that recursive scan today. Clean, safe, general. *The clearest win.*
+- **#2 — smarter dependency fetch.** Scanning all of `pg_depend` for a small
+  `-n` dump is a real algorithmic inefficiency. The "fetch only deps of loaded
+  objects" idea is general (correctness rests on: `getDependencies` already
+  ignores deps whose depender isn't a loaded object).
+
+**🟡 General idea, needs design work to be safe for everyone:**
+- **#1 — `-N`/`-n` catalog pushdown.** It's a real, known inefficiency that
+  `-N`/`-n` don't prevent metadata reads/locks. Helping everyone with large DBs.
+  *But* our version assumes excluded schemas are truly isolated; the general
+  case (cross-schema FKs, inherited columns, shared types) would break silently.
+  Upstreaming requires skipping objects only when provably unreferenced, or an
+  explicit opt-in flag with documented caveats.
+
+**🔴 Specific to this deployment (a convenience layer, not upstream material):**
+- The hardcoded **`__` prefix** default and "assume isolation" behavior — our
+  naming scheme, not universal.
+
+### Contribution roadmap (later)
+
+1. **Extract #3 (matview guard) as a standalone patch** against `master`, with a
+   minimal reproducer. Small, safe, likely well-received → start here.
+2. **Post a performance report to `pgsql-hackers`**: the `LOCK TABLE` storm and
+   the `pg_depend` full scan on partial dumps, with before/after benchmark
+   numbers. Reproducible numbers drive real fixes even if our patches aren't
+   merged verbatim.
+3. **Propose the `-N`/`-n` pushdown as a design discussion**, not a finished
+   patch — the correctness design is the hard part; let the community own it.
+4. Do **not** propose the `__`-prefix default upstream; keep it as our layer.
+
+Caveat to state honestly upstream: a 1.5M-table database is itself an
+anti-pattern; some maintainers will (fairly) say "fix the schema design." Both
+are true — `pg_dump` should be more robust to it, *and* the ETL creating
+millions of `__` tables is worth revisiting.
+
+### Open items / ideas to explore
+- Make #2 (fast deps) handle the case where `buildMatViewRefreshDependencies`
+  *is* needed (matviews present) — currently that path still does the recursive
+  scan; could apply the same isolated-schema filter to it.
+- Trim the remaining ~2–4 s fixed cost: `getTables`/`getTypes`/ACL phases still
+  use `NOT IN` subqueries over the bloated `pg_class`/`pg_type`.
+- Decide whether `--exclude-isolated-schema` should accept glob patterns (it is
+  currently exact-name).
