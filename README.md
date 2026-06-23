@@ -1,15 +1,30 @@
-pg_dump_plus
-============
+# pg_dump_plus
 
-A small patch set on top of PostgreSQL's `pg_dump` (`REL_17_STABLE`) that makes
-schema-selective dumps **fast on databases bloated with huge numbers of
-relations** — where stock `pg_dump` is unusably slow or fails outright
-(`out of shared memory` from locking millions of tables). It pushes `-N`
-(exclude) and `-n` (include) schema selection **down into the catalog queries**,
-so metadata, locks, and dependency edges are never built for schemas that won't
-be dumped.
+**pg_dump_plus — schema-selective pg_dump that doesn't choke on million-table catalogs.**
 
-Results on a real DB (~1.5M tables across isolated schemas):
+pg_dump_plus is a small patch set on PostgreSQL 17's `pg_dump` for databases
+polluted with huge numbers of relations (e.g. millions of auto-generated
+tables), where stock `pg_dump` is unusably slow or fails outright with
+*out of shared memory*. It pushes `-N` (exclude) and `-n` (include) schema
+selection down into the catalog queries, so metadata, table locks, and
+dependency-graph edges are never built for schemas that won't be dumped. On a
+real ~1.5M-table database, a selective dump that stock `pg_dump` couldn't
+complete now finishes in seconds.
+
+> Forked from the **postgres/postgres GitHub mirror**. That mirror doesn't take
+> pull requests; upstream contributions go through the patch process —
+> https://wiki.postgresql.org/wiki/Submitting_a_Patch
+
+## Feature highlights
+- 🚀 **Catalog-level `-N`/`-n` pushdown** — excluded/non-included schemas are never fetched, locked, or graphed (not just filtered after the fact like stock `pg_dump`).
+- 🧱 **Survives catalog bloat** — turns stock's *out of shared memory* `LOCK TABLE` storm into a working dump.
+- ⚡ **Fast dependency collection** — fetches `pg_depend` edges only for loaded objects via indexed lookups instead of scanning the whole catalog (~23 s → ~0.09 s).
+- ⏭️ **Skips needless work** — no recursive matview-refresh scan when no materialized view is dumped (was an 8-min hang).
+- 🎛️ **Drop-in & reversible** — no new flags; reuses native `-N`/`-n`. Env toggles `PGDUMP_PLUS_FAST_EXCLUDE=0` / `PGDUMP_PLUS_FAST_DEPS=0` restore exact stock behavior.
+- 🔎 **Built-in diagnostics** — `PGDUMP_PLUS_TIMING=1` prints per-phase timing to find bottlenecks.
+- 📋 **Honest correctness model** — documented limitations (cross-schema inheritance/ownership) and a guaranteed-correct escape hatch.
+
+## Measured impact (real DB: ~1.5M tables across isolated schemas)
 
 | | stock `pg_dump` | pg_dump_plus |
 |---|---|---|
@@ -18,7 +33,7 @@ Results on a real DB (~1.5M tables across isolated schemas):
 | `reading dependency data` | ~23 s | **~0.09 s** |
 | matview-refresh step (no matviews) | 8+ min hang | **0 s** |
 
-Quick start:
+## Quick start
 
 ```bash
 ./configure --with-zlib --with-icu --with-readline
