@@ -190,13 +190,65 @@ make -C src/bin/pg_dump -j4
 `--with-lz4 --with-zstd` if those dev libraries are installed and you want
 those compression methods.
 
-## Limitations / notes
+## Correctness model & limitations
 
-- Catalog-level exclusion is safe only for genuinely isolated schemas (see the
-  assumption above). If a dumped object references an isolated schema, that
-  reference will be missing on restore.
-- The patch is additive and gated: with no prefix and no
-  `--exclude-isolated-schema`, behavior is identical to stock `pg_dump`.
+The fast path skips *fetching catalog metadata* for schemas pg_dump has already
+decided not to dump (via `-N` excludes or `-n` includes). Stock pg_dump instead
+fetches **everything** and uses the full picture for (a) ordering and (b)
+computing derived details of the kept objects. Skipping is correct **only when
+what you keep does not structurally need what you skipped.**
+
+**Does a schema have to be "isolated"?**
+- The schema you **ignore/exclude** must be isolated in the *inheritance/ownership*
+  sense (see hazard below).
+- The schema you **keep/include** does **not** need to be isolated — it is dumped
+  normally and may reference anything.
+
+### Plain references — safe (no worse than stock `-N`/`-n`)
+A kept object that *references* an excluded object **by name** is fine, and
+behaves exactly like stock `-N`/`-n`:
+- FK from a kept table to a table in an ignored schema
+- a kept table column whose **type** lives in an ignored schema
+- a kept **view**/function whose body reads an ignored schema
+
+In all these, pg_dump emits the reference by qualified name regardless of the
+fast path; it does **not** recreate the ignored object, so **restore requires
+that object to already exist in the target**. This limitation is inherent to
+`-N`/`-n`, not introduced here.
+
+### The real hazard the pushdown adds: cross-schema **inheritance/ownership**
+Stock pg_dump fetches *all* tables specifically to compute inherited columns and
+owned sequences. With the pushdown, an ignored parent isn't loaded, so:
+- A **kept child table that `INHERITS` from a parent in an ignored schema** can
+  get its inherited-column handling **wrong** — the one case where output may
+  differ from stock.
+- A kept sequence **`OWNED BY`** a column in an ignored schema (rare, manual
+  cross-schema ownership) can trigger a `failed sanity check` abort.
+
+So: **the ignored schema must not be inherited-from or owned-across by anything
+you keep.**
+
+### What stays correct automatically
+- System schemas (`pg_catalog`, `pg_toast`, `information_schema`) are **never**
+  pushed down, so built-in/array/column type resolution is unaffected.
+- Dependency *ordering among dumped objects* is preserved (the fast
+  `getDependencies` fetches all deps whose depender is a loaded object; deps to
+  non-dumped objects are irrelevant).
+- Global catalog reads that assume all tables are loaded are filtered to match
+  (`getRules`, `getPartitioningInfo`); others (`getConstraints`, `getPolicies`,
+  `getPublicationTables`) already tolerate missing tables.
+- The matview-refresh step is skipped only when no materialized view is dumped.
+
+### Escape hatch (guaranteed-stock correctness)
+If unsure whether a given dump is "isolated enough", run with both
+`PGDUMP_PLUS_FAST_EXCLUDE=0` and `PGDUMP_PLUS_FAST_DEPS=0`: this reverts to
+stock pg_dump behavior — correct for every case, just slow. Diff the fast vs
+stock output once for a given schema set; if identical, the fast path is safe
+for that shape.
+
+### Other notes
+- With no `-N`/`-n`, behavior is identical to stock `pg_dump` (nothing is
+  excluded).
 - Custom `pg_dump` must be **≥** the server version, as always.
 
 ---
