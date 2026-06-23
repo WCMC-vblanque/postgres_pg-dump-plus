@@ -43,6 +43,17 @@ diff -I 'restrict ' stock.sql fast.sql && echo "SAFE: identical"
 ```
 (The stock run is slow but only needed once per schema shape.)
 
+### Publish to GitHub
+- Create a GitHub repo / fork under our account (e.g. `pg_dump_plus`, or a fork
+  of `postgres/postgres`) and push the work branches:
+  `pg-dump-plus/exclude-prefixed-schemas` and `pg-dump-plus/generic-fast-exclude`.
+- Add a top-level README pointing at `FEATURE_pg_dump_plus.md` (what it does,
+  build steps, env toggles, correctness model/limitations).
+- Decide license/attribution note (PostgreSQL is under the PostgreSQL License;
+  keep upstream headers; mark our changes clearly).
+- Optional: open it as a public fork to support the upstream contribution
+  roadmap (matview-guard patch first — see FEATURE doc).
+
 ### Open items / follow-ups (later)
 - Refresh the older sections of FEATURE_pg_dump_plus.md (Usage examples + the
   "Summary of changes" table still mention the removed `--exclude-isolated-schema`
