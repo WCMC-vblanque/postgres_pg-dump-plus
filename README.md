@@ -33,9 +33,28 @@ complete now finishes in seconds.
 | `reading dependency data` | ~23 s | **~0.09 s** |
 | matview-refresh step (no matviews) | 8+ min hang | **0 s** |
 
+## Install
+
+**Option A — prebuilt binary (Linux x86_64, glibc ≥ 2.39 / Ubuntu 24.04).**
+Download the tarball from the repo's **Releases**, then (no root):
+```bash
+tar -xzf pg_dump_plus-17-*-linux-x86_64.tar.gz
+cd pg_dump_plus-17-*/ && ./install.sh        # -> ~/.local/bin/pg_dump_plus
+pg_dump_plus --version                        # pg_dump (PostgreSQL) 17.10
+```
+
+**Option B — build from source (any platform).** From a checkout of this repo:
+```bash
+scripts/install-from-source.sh                # -> ~/pgdumpplus/bin/pg_dump
+# needs: git gcc make bison flex zlib1g-dev libicu-dev libreadline-dev
+```
+
+The custom `pg_dump` must be **≥** your server's PostgreSQL version.
+
 ## Quick start
 
 ```bash
+# build manually (alternative to the installers above)
 ./configure --with-zlib --with-icu --with-readline
 make -C src/backend generated-headers
 make -C src/bin/pg_dump -j4            # -> src/bin/pg_dump/pg_dump

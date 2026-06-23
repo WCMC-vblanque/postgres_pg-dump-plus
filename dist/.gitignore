@@ -1,0 +1,2 @@
+# Prebuilt release tarballs are published as GitHub Release assets, not committed.
+*.tar.gz
