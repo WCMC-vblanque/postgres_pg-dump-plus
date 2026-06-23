@@ -1007,9 +1007,32 @@ main(int argc, char **argv)
 
 	if (!dopt.schemaOnly)
 	{
+		bool		have_matview = false;
+		int			mvi;
+
 		pgdp_timing_mark("collecting table data references");
 		getTableData(&dopt, tblinfo, numTables, 0);
-		buildMatViewRefreshDependencies(fout);
+
+		/*
+		 * pg_dump_plus: buildMatViewRefreshDependencies() runs a recursive
+		 * scan of pg_depend, which is catastrophically slow when pg_depend is
+		 * bloated by isolated schemas.  It is only needed when a materialized
+		 * view is actually being dumped, so skip it otherwise.
+		 */
+		for (mvi = 0; mvi < numTables; mvi++)
+		{
+			if (tblinfo[mvi].relkind == RELKIND_MATVIEW &&
+				tblinfo[mvi].dobj.dump != DUMP_COMPONENT_NONE)
+			{
+				have_matview = true;
+				break;
+			}
+		}
+
+		pgdp_timing_mark("building matview refresh dependencies");
+		if (have_matview)
+			buildMatViewRefreshDependencies(fout);
+
 		if (dopt.dataOnly)
 			getTableDataFKConstraints();
 	}

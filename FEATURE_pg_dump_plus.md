@@ -107,6 +107,15 @@ discards any dependency whose depender is not a loaded object.
   ~4s**. Output is byte-identical to the safe path (verified with `diff`,
   ignoring the random per-run `\restrict` token).
 
+## Skipping matview refresh dependencies
+
+`buildMatViewRefreshDependencies()` runs a *recursive* scan of `pg_depend` (for
+data dumps) to order materialized-view refreshes. On a `pg_depend` bloated by
+isolated schemas this can hang for many minutes -- even when the database has
+**no materialized views at all**. pg_dump_plus skips this step unless a
+materialized view is actually being dumped. Always-on and safe (the step
+produces nothing when there are no matviews).
+
 ## Phase timing (diagnostics)
 
 Set `PGDUMP_PLUS_TIMING=1` to print, to stderr, how long each metadata-read
