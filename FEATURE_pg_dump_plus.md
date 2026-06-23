@@ -14,7 +14,7 @@ memory-hungry, and can fail outright:
 
 ```
 pg_dump: error: query failed: ERROR:  out of shared memory
-pg_dump: detail: Query was: LOCK TABLE "big_schema_n…"."cell_00001_…", …
+pg_dump: detail: Query was: LOCK TABLE "big_schema"."cell_00001", "big_schema"."cell_00002", …
 ```
 
 `pg_dump` tries to `LOCK TABLE` every table it considers, and exhausts
@@ -77,7 +77,7 @@ without `--verbose`) the schemas it is ignoring, so you can confirm exactly
 what was left out:
 
 ```
-pg_dump_plus: ignoring 12 isolated schema(s): big_schema_n2026…, big_schema_g2026…, …
+pg_dump_plus: excluding 12 schema(s) at catalog level: big_schema_1, big_schema_2, …
 ```
 
 If the feature is enabled but nothing matched, it prints

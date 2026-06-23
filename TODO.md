@@ -1,20 +1,19 @@
 # pg_dump_plus — TODO
 
-## 2026-06-24: Test branch `pg-dump-plus/generic-fast-exclude` on the server
+## Test branch `pg-dump-plus/generic-fast-exclude` on the server
 
 Goal: validate the generic fast schema exclusion/inclusion (`-N` / `-n`
-catalog-level pushdown) against the real `mydb` on the server.
+catalog-level pushdown) against the target database on the server.
 
 ### 0. Deploy
 ```bash
-# from WSL
-scp /mnt/c/Users/youruser/Documents/_perso/05_Vibe-Coding-Prototypes/05_pg-dump-plus/src/bin/pg_dump/pg_dump \
-    you@server:~/bin/pg_dump_plus
+# from the build host
+scp .../05_pg-dump-plus/src/bin/pg_dump/pg_dump  you@server:~/bin/pg_dump_plus
 ssh you@server 'chmod +x ~/bin/pg_dump_plus'
 ```
-(Make sure the build is from this branch: `git -C 05_pg-dump-plus branch --show-current`
-should be `pg-dump-plus/generic-fast-exclude`, then rebuild
-`make -C src/bin/pg_dump -j4` before scp.)
+(Make sure the build is from this branch: `git branch --show-current` should be
+`pg-dump-plus/generic-fast-exclude`, then rebuild `make -C src/bin/pg_dump -j4`
+before scp.)
 
 ### 1. Confirm safety of target schema(s) first (FEATURE doc: "Correctness model")
 For each schema you dump, the two fast-path hazards must be empty:
@@ -24,13 +23,14 @@ For each schema you dump, the two fast-path hazards must be empty:
 
 ### 2. Functional tests on the server
 ```bash
-export PGPASSWORD='...'   # from .env
-# a) dump only my_schema (include pushdown)
-~/bin/pg_dump_plus -h localhost -U 'myuser' -d mydb \
-  -n my_schema -Fc --compress=gzip:1 -f basemap.dump
-# b) exclude __ snapshots, keep the rest (exclude pattern)
-~/bin/pg_dump_plus -h localhost -U 'myuser' -d mydb \
-  -N '__*' -s -f rest_schema.sql
+export PGPASSWORD='...'        # do NOT hardcode; read from a secrets file
+DB=mydb; USER=myuser
+# a) dump only one schema (include pushdown)
+~/bin/pg_dump_plus -h localhost -U "$USER" -d "$DB" \
+  -n my_schema -Fc --compress=gzip:1 -f out.dump
+# b) exclude snapshot schemas, keep the rest (exclude pattern)
+~/bin/pg_dump_plus -h localhost -U "$USER" -d "$DB" \
+  -N 'tmp_*' -s -f rest_schema.sql
 ```
 Watch for: `pg_dump_plus: excluding N schema(s)…` notice; NO `failed sanity
 check …` errors; completes in seconds + data copy.
@@ -44,15 +44,10 @@ diff -I 'restrict ' stock.sql fast.sql && echo "SAFE: identical"
 (The stock run is slow but only needed once per schema shape.)
 
 ### Publish to GitHub
-- Create a GitHub repo / fork under our account (e.g. `pg_dump_plus`, or a fork
-  of `postgres/postgres`) and push the work branches:
-  `pg-dump-plus/exclude-prefixed-schemas` and `pg-dump-plus/generic-fast-exclude`.
-- Add a top-level README pointing at `FEATURE_pg_dump_plus.md` (what it does,
-  build steps, env toggles, correctness model/limitations).
-- Decide license/attribution note (PostgreSQL is under the PostgreSQL License;
-  keep upstream headers; mark our changes clearly).
-- Optional: open it as a public fork to support the upstream contribution
-  roadmap (matview-guard patch first — see FEATURE doc).
+- Done: pushed to a fork; binary published as a GitHub Release.
+- Keep the README pointing at `FEATURE_pg_dump_plus.md`.
+- License/attribution: PostgreSQL License; upstream headers preserved; our
+  changes marked with `pg_dump_plus` comments.
 
 ### Open items / follow-ups (later)
 - Refresh the older sections of FEATURE_pg_dump_plus.md (Usage examples + the
@@ -62,5 +57,5 @@ diff -I 'restrict ' stock.sql fast.sql && echo "SAFE: identical"
   getOwnedSeqs() — harden only if it ever shows up.
 - Decide whether to make `PGDUMP_PLUS_TIMING` a `--timing` CLI flag.
 - Upstream roadmap (matview-guard patch first) — see FEATURE doc.
-- If all good, consider merging `pg-dump-plus/generic-fast-exclude` into
-  `pg-dump-plus/exclude-prefixed-schemas` (or a clean main).
+- If all good, consider merging `pg-dump-plus/generic-fast-exclude` into a clean
+  main branch.
